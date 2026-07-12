@@ -6,9 +6,10 @@ import hashlib
 import json
 import logging
 import os
+import re
 import subprocess
 import time
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from llm_relay.orch.models import CLIStatus, DelegationResult
 
@@ -26,6 +27,12 @@ _DEFAULT_TIMEOUT = int(os.environ.get("LLM_RELAY_ORCH_EXEC_TIMEOUT", "120"))
 # Tokens are GitHub-installation tokens that expire after 60 minutes; we
 # cache for 50 minutes to leave a comfortable margin.
 #
+# Per-repo routing (docs/memos/2026-07-12-codex-per-repo-token-routing.md):
+# When a config file at ~/.llm-relay/codex-gh-agents.json is present, the
+# executor infers the target repo from `working_dir`'s git origin and picks
+# a per-repo agent name from the mappings. Without the config, falls back
+# to the LLM_RELAY_CODEX_GH_AGENT env var (default `codex-reviewer`).
+#
 # Disable by unsetting LLM_RELAY_CODEX_GH_TOKEN_SCRIPT (or pointing it at a
 # non-existent path). Disabled by default — feature only activates when the
 # script exists and is executable.
@@ -33,20 +40,125 @@ _CODEX_GH_TOKEN_SCRIPT = os.environ.get(
     "LLM_RELAY_CODEX_GH_TOKEN_SCRIPT",
     os.path.expanduser("~/.llm-relay/github-apps/generate-token.sh"),
 )
-_CODEX_GH_TOKEN_AGENT = os.environ.get("LLM_RELAY_CODEX_GH_AGENT", "codex-reviewer")
+_CODEX_GH_TOKEN_AGENT_DEFAULT = os.environ.get("LLM_RELAY_CODEX_GH_AGENT", "codex-reviewer")
 _CODEX_GH_TOKEN_TTL_S = 3000  # 50 min cache; tokens themselves expire at 60
-_codex_gh_token_cache: Optional[tuple] = None  # (token, expiry_monotonic)
+_codex_gh_token_cache: Dict[str, Tuple[str, float]] = {}  # {agent: (token, expiry)}
+
+_CODEX_GH_AGENTS_CONFIG_PATH = os.path.expanduser(
+    os.environ.get("LLM_RELAY_CODEX_GH_AGENTS_CONFIG", "~/.llm-relay/codex-gh-agents.json")
+)
 
 
-def _get_codex_gh_token() -> Optional[str]:
+def _infer_repo_from_working_dir(working_dir: Optional[str]) -> Optional[str]:
+    """Return `owner/name` inferred from working_dir's git origin, or None.
+
+    Handles SSH (git@github.com:owner/name.git), HTTPS
+    (https://github.com/owner/name.git), and github: (github:owner/name)
+    URL shapes. Best-effort — returns None on any failure without raising.
+    """
+    if not working_dir or not os.path.isdir(working_dir):
+        return None
+    try:
+        proc = subprocess.run(
+            ["git", "-C", working_dir, "remote", "get-url", "origin"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            stdin=subprocess.DEVNULL,
+        )
+        if proc.returncode != 0:
+            return None
+        url = proc.stdout.strip()
+    except Exception:
+        return None
+    if not url:
+        return None
+
+    # Match owner/name from any of: git@host:owner/name, https://host/owner/name,
+    # ssh://git@host/owner/name, github:owner/name.
+    m = re.search(r"[:/]([^/:]+)/([^/]+?)(?:\.git)?/?$", url)
+    if not m:
+        return None
+    return f"{m.group(1)}/{m.group(2)}"
+
+
+def _load_codex_gh_agents_config() -> Optional[dict]:
+    """Load ~/.llm-relay/codex-gh-agents.json or return None on any failure.
+
+    None means "no per-repo routing configured; use the env-var agent." That's
+    the pre-existing behavior and the default for installs that don't opt in.
+    """
+    path = _CODEX_GH_AGENTS_CONFIG_PATH
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "r") as f:
+            cfg = json.load(f)
+        if not isinstance(cfg, dict):
+            logger.info("codex-gh-agents.json is not a JSON object; ignoring")
+            return None
+        return cfg
+    except Exception:
+        logger.info("codex-gh-agents.json unreadable or invalid JSON; ignoring")
+        return None
+
+
+def _pick_codex_gh_agent(working_dir: Optional[str]) -> str:
+    """Pick the codex GH App agent name for a Codex invocation targeting
+    `working_dir`. Returns the env-var default if no config or no match.
+
+    Longest-prefix wins when multiple mappings match. Supports two mapping
+    shapes:
+      - exact: "owner/repo" matches only that repo
+      - trailing-wildcard: "owner/*" matches all repos under owner
+    Any other value is treated as an exact match.
+    """
+    cfg = _load_codex_gh_agents_config()
+    if not cfg:
+        return _CODEX_GH_TOKEN_AGENT_DEFAULT
+
+    repo = _infer_repo_from_working_dir(working_dir)
+    mappings = cfg.get("mappings") if isinstance(cfg.get("mappings"), dict) else {}
+    default_agent = cfg.get("default_agent") or _CODEX_GH_TOKEN_AGENT_DEFAULT
+
+    if not repo:
+        return default_agent
+
+    # Match repo against every mapping key; keep the longest that matches.
+    best: Optional[Tuple[int, str]] = None  # (match_length, agent_name)
+    for key, agent in mappings.items():
+        if not isinstance(key, str) or not isinstance(agent, str):
+            continue
+        if key.endswith("/*"):
+            prefix = key[:-1]  # keep trailing slash
+            if repo.startswith(prefix):
+                match_len = len(prefix)
+                if best is None or match_len > best[0]:
+                    best = (match_len, agent)
+        else:
+            # Exact match
+            if repo == key:
+                match_len = len(key) + 1000  # exact always beats wildcard
+                if best is None or match_len > best[0]:
+                    best = (match_len, agent)
+    if best:
+        return best[1]
+    return default_agent
+
+
+def _get_codex_gh_token(working_dir: Optional[str] = None) -> Optional[str]:
     """Generate (or return cached) GitHub App installation token for Codex.
 
-    Returns None silently if the script doesn't exist, isn't executable, or
-    fails — callers must tolerate that and continue without the env injection.
+    Picks the agent per _pick_codex_gh_agent(working_dir). Returns None
+    silently if the script doesn't exist, isn't executable, or fails —
+    callers must tolerate that and continue without the env injection.
     """
     global _codex_gh_token_cache
-    if _codex_gh_token_cache:
-        token, expiry = _codex_gh_token_cache
+    agent = _pick_codex_gh_agent(working_dir)
+
+    cached = _codex_gh_token_cache.get(agent)
+    if cached:
+        token, expiry = cached
         if time.monotonic() < expiry:
             return token
 
@@ -56,7 +168,7 @@ def _get_codex_gh_token() -> Optional[str]:
 
     try:
         proc = subprocess.run(
-            [script, _CODEX_GH_TOKEN_AGENT],
+            [script, agent],
             capture_output=True,
             text=True,
             timeout=15,
@@ -64,8 +176,8 @@ def _get_codex_gh_token() -> Optional[str]:
         )
         if proc.returncode == 0 and proc.stdout.strip():
             token = proc.stdout.strip()
-            _codex_gh_token_cache = (token, time.monotonic() + _CODEX_GH_TOKEN_TTL_S)
-            logger.debug("Codex GH token generated (cached %ds)", _CODEX_GH_TOKEN_TTL_S)
+            _codex_gh_token_cache[agent] = (token, time.monotonic() + _CODEX_GH_TOKEN_TTL_S)
+            logger.debug("Codex GH token generated for %s (cached %ds)", agent, _CODEX_GH_TOKEN_TTL_S)
             return token
         logger.debug("Codex GH token script returned %d: %s", proc.returncode, proc.stderr.strip()[:200])
     except Exception:
@@ -76,7 +188,7 @@ def _get_codex_gh_token() -> Optional[str]:
 def _reset_codex_gh_token_cache_for_test() -> None:
     """Test helper — clear the in-memory cache."""
     global _codex_gh_token_cache
-    _codex_gh_token_cache = None
+    _codex_gh_token_cache = {}
 
 
 def execute_cli(
@@ -131,7 +243,7 @@ def execute_cli(
     # opt-in / disable contract.
     env = None
     if cli.cli_id == "openai-codex":
-        gh_token = _get_codex_gh_token()
+        gh_token = _get_codex_gh_token(working_dir=working_dir)
         if gh_token:
             env = {**os.environ, "GH_TOKEN": gh_token}
 
