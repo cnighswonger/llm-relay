@@ -338,6 +338,179 @@ class TestCodexGhTokenInjection:
             f"token script should only be called once due to caching, was called {script_calls['count']} times"
 
 
+class TestCodexPerRepoTokenRouting:
+    """Verify the per-repo GH App agent selection introduced by
+    docs/memos/2026-07-12-codex-per-repo-token-routing.md.
+
+    Behavior invariants:
+    - No config file → env-var default agent (backwards compat).
+    - Config file + matching mapping → picks the mapping's agent.
+    - Longest-prefix wins when multiple wildcards match.
+    - Exact match beats any wildcard.
+    - No matching mapping AND config's default_agent set → uses default_agent.
+    - working_dir=None → env-var default (can't infer repo).
+    """
+
+    def setup_method(self):
+        from llm_relay.orch.executor import _reset_codex_gh_token_cache_for_test
+        _reset_codex_gh_token_cache_for_test()
+
+    def _write_config(self, tmp_path, cfg):
+        import json
+        p = tmp_path / "codex-gh-agents.json"
+        p.write_text(json.dumps(cfg))
+        return str(p)
+
+    def test_no_config_falls_back_to_env_default(self, tmp_path):
+        """No config file → env-var default agent name."""
+        from llm_relay.orch.executor import _pick_codex_gh_agent
+        with patch("llm_relay.orch.executor._CODEX_GH_AGENTS_CONFIG_PATH", str(tmp_path / "nonexistent.json")):
+            with patch("llm_relay.orch.executor._CODEX_GH_TOKEN_AGENT_DEFAULT", "envdefault"):
+                assert _pick_codex_gh_agent(None) == "envdefault"
+
+    def test_working_dir_none_uses_default(self, tmp_path):
+        """working_dir=None → config's default_agent if present, else env default."""
+        from llm_relay.orch.executor import _pick_codex_gh_agent
+        cfg_path = self._write_config(tmp_path, {
+            "mappings": {"vsits/*": "codex-reviewer-vsits"},
+            "default_agent": "cfg-default",
+        })
+        with patch("llm_relay.orch.executor._CODEX_GH_AGENTS_CONFIG_PATH", cfg_path):
+            assert _pick_codex_gh_agent(None) == "cfg-default"
+
+    def test_wildcard_matches_repo_owner(self, tmp_path):
+        """`vsits/*` matches any vsits/foo repo."""
+        from llm_relay.orch.executor import _pick_codex_gh_agent
+        cfg_path = self._write_config(tmp_path, {
+            "mappings": {"vsits/*": "codex-reviewer-vsits"}
+        })
+        with patch("llm_relay.orch.executor._CODEX_GH_AGENTS_CONFIG_PATH", cfg_path):
+            with patch("llm_relay.orch.executor._infer_repo_from_working_dir", return_value="vsits/agent-chat"):
+                assert _pick_codex_gh_agent("/whatever") == "codex-reviewer-vsits"
+
+    def test_longest_prefix_wildcard_wins(self, tmp_path):
+        """When two wildcards match, longer wins (`vsits/legacy-*` > `vsits/*`)."""
+        from llm_relay.orch.executor import _pick_codex_gh_agent
+        cfg_path = self._write_config(tmp_path, {
+            "mappings": {
+                "vsits/*": "vsits-general",
+                "vsits/legacy-cartographer": "vsits-legacy",
+            }
+        })
+        with patch("llm_relay.orch.executor._CODEX_GH_AGENTS_CONFIG_PATH", cfg_path):
+            with patch("llm_relay.orch.executor._infer_repo_from_working_dir", return_value="vsits/legacy-cartographer"):
+                # Exact match beats wildcard.
+                assert _pick_codex_gh_agent("/whatever") == "vsits-legacy"
+            with patch("llm_relay.orch.executor._infer_repo_from_working_dir", return_value="vsits/agent-chat"):
+                assert _pick_codex_gh_agent("/whatever") == "vsits-general"
+
+    def test_exact_beats_wildcard(self, tmp_path):
+        """Exact repo match beats a wildcard on the same owner."""
+        from llm_relay.orch.executor import _pick_codex_gh_agent
+        cfg_path = self._write_config(tmp_path, {
+            "mappings": {
+                "vsits/*": "vsits-general",
+                "vsits/agent-chat": "vsits-chat-specific",
+            }
+        })
+        with patch("llm_relay.orch.executor._CODEX_GH_AGENTS_CONFIG_PATH", cfg_path):
+            with patch("llm_relay.orch.executor._infer_repo_from_working_dir", return_value="vsits/agent-chat"):
+                assert _pick_codex_gh_agent("/whatever") == "vsits-chat-specific"
+
+    def test_no_match_uses_default_agent(self, tmp_path):
+        """No matching mapping → config's default_agent."""
+        from llm_relay.orch.executor import _pick_codex_gh_agent
+        cfg_path = self._write_config(tmp_path, {
+            "mappings": {"vsits/*": "codex-reviewer-vsits"},
+            "default_agent": "cfg-fallback",
+        })
+        with patch("llm_relay.orch.executor._CODEX_GH_AGENTS_CONFIG_PATH", cfg_path):
+            with patch("llm_relay.orch.executor._infer_repo_from_working_dir", return_value="cnighswonger/kanfei-adsb"):
+                assert _pick_codex_gh_agent("/whatever") == "cfg-fallback"
+
+    def test_no_match_no_default_uses_env(self, tmp_path):
+        """No mapping match AND no default_agent → env-var agent."""
+        from llm_relay.orch.executor import _pick_codex_gh_agent
+        cfg_path = self._write_config(tmp_path, {
+            "mappings": {"vsits/*": "codex-reviewer-vsits"}
+        })
+        with patch("llm_relay.orch.executor._CODEX_GH_AGENTS_CONFIG_PATH", cfg_path):
+            with patch("llm_relay.orch.executor._CODEX_GH_TOKEN_AGENT_DEFAULT", "envdefault"):
+                with patch("llm_relay.orch.executor._infer_repo_from_working_dir", return_value="unknown/repo"):
+                    assert _pick_codex_gh_agent("/whatever") == "envdefault"
+
+    def test_invalid_json_falls_back_silently(self, tmp_path):
+        """Invalid JSON → treat as no config, don't raise."""
+        from llm_relay.orch.executor import _pick_codex_gh_agent
+        p = tmp_path / "broken.json"
+        p.write_text("this is not json {")
+        with patch("llm_relay.orch.executor._CODEX_GH_AGENTS_CONFIG_PATH", str(p)):
+            with patch("llm_relay.orch.executor._CODEX_GH_TOKEN_AGENT_DEFAULT", "envdefault"):
+                assert _pick_codex_gh_agent("/whatever") == "envdefault"
+
+    def test_cache_is_keyed_by_agent(self, tmp_path):
+        """Two invocations with different working_dirs get different tokens."""
+        from llm_relay.orch.executor import _get_codex_gh_token
+        token_script = tmp_path / "gen.sh"
+        # Script returns a per-agent token: "token-<agent>"
+        token_script.write_text('#!/bin/bash\necho "token-$1"\n')
+        token_script.chmod(0o755)
+        cfg_path = self._write_config(tmp_path, {
+            "mappings": {
+                "vsits/*": "agent-a",
+                "cnighswonger/*": "agent-b",
+            }
+        })
+        with patch("llm_relay.orch.executor._CODEX_GH_TOKEN_SCRIPT", str(token_script)):
+            with patch("llm_relay.orch.executor._CODEX_GH_AGENTS_CONFIG_PATH", cfg_path):
+                with patch("llm_relay.orch.executor._infer_repo_from_working_dir", return_value="vsits/x"):
+                    t1 = _get_codex_gh_token("/tmp/vsits")
+                with patch("llm_relay.orch.executor._infer_repo_from_working_dir", return_value="cnighswonger/y"):
+                    t2 = _get_codex_gh_token("/tmp/cnigh")
+        assert t1 == "token-agent-a"
+        assert t2 == "token-agent-b"
+
+
+class TestInferRepoFromWorkingDir:
+    """Verify owner/name extraction from various git remote URL shapes."""
+
+    def _make_git_repo(self, tmp_path, remote_url):
+        """Create a bare-bones git working dir with an `origin` remote set."""
+        import subprocess as sp
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        sp.run(["git", "init", "-q"], cwd=repo, check=True)
+        sp.run(["git", "remote", "add", "origin", remote_url], cwd=repo, check=True)
+        return str(repo)
+
+    def test_ssh_url(self, tmp_path):
+        from llm_relay.orch.executor import _infer_repo_from_working_dir
+        repo = self._make_git_repo(tmp_path, "git@github.com:vsits/agent-chat.git")
+        assert _infer_repo_from_working_dir(repo) == "vsits/agent-chat"
+
+    def test_https_url(self, tmp_path):
+        from llm_relay.orch.executor import _infer_repo_from_working_dir
+        repo = self._make_git_repo(tmp_path, "https://github.com/cnighswonger/kanfei-adsb.git")
+        assert _infer_repo_from_working_dir(repo) == "cnighswonger/kanfei-adsb"
+
+    def test_ssh_url_no_dot_git_suffix(self, tmp_path):
+        from llm_relay.orch.executor import _infer_repo_from_working_dir
+        repo = self._make_git_repo(tmp_path, "git@github.com:owner/name")
+        assert _infer_repo_from_working_dir(repo) == "owner/name"
+
+    def test_none_working_dir(self):
+        from llm_relay.orch.executor import _infer_repo_from_working_dir
+        assert _infer_repo_from_working_dir(None) is None
+
+    def test_nonexistent_dir(self, tmp_path):
+        from llm_relay.orch.executor import _infer_repo_from_working_dir
+        assert _infer_repo_from_working_dir(str(tmp_path / "nope")) is None
+
+    def test_non_git_dir(self, tmp_path):
+        from llm_relay.orch.executor import _infer_repo_from_working_dir
+        assert _infer_repo_from_working_dir(str(tmp_path)) is None
+
+
 class TestPromptUtils:
     def test_hash_deterministic(self):
         h1 = prompt_hash("hello")
